@@ -1,89 +1,119 @@
-from fastapi import FastAPI, Request, HTTPException
-import json
 import os
-from datetime import datetime
+import json
+import requests
+import redis
+import google.generativeai as genai
+from fastapi import FastAPI, Request
+from dotenv import load_dotenv
 
-# Cria a instância do FastAPI com documentação
-app = FastAPI(
-    title="Servidor de Webhook para WhatsApp",
-    description="Recebe e exibe notificações da Evolution API em tempo real.",
-    version="1.0.0"
-)
+# --- Carregando as Configurações do .env ---
+load_dotenv()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME") # <-- Carrega o nome do modelo
+SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT")
+REDIS_URL = os.getenv("REDIS_URL")
+EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL")
+EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY")
+EVOLUTION_INSTANCE_NAME = os.getenv("EVOLUTION_INSTANCE_NAME")
+TARGET_JID = os.getenv("TARGET_JID")
 
-def formatar_evento_webhook(evento: dict):
-    """
-    Formata o JSON do webhook para uma exibição mais amigável no log.
-    Tenta extrair as informações mais relevantes.
-    """
+# --- Verificação de Configuração Essencial ---
+config_vars = [GEMINI_API_KEY, GEMINI_MODEL_NAME, SYSTEM_PROMPT, REDIS_URL, EVOLUTION_API_URL, EVOLUTION_API_KEY, EVOLUTION_INSTANCE_NAME, TARGET_JID]
+if not all(config_vars):
+    print("🚨 ERRO CRÍTICO: Verifique se todas as variáveis de ambiente estão definidas no seu arquivo .env!")
+    exit()
+
+# --- Configuração dos Clientes ---
+# Cliente do Gemini, agora com o modelo e a persona carregados do .env
+try:
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel(
+        model_name=GEMINI_MODEL_NAME, # <-- Usa a variável aqui
+        system_instruction=SYSTEM_PROMPT
+    )
+    print(f"✅ Modelo Gemini '{GEMINI_MODEL_NAME}' configurado com a persona.")
+except Exception as e:
+    print(f"🚨 ERRO CRÍTICO ao configurar o modelo Gemini: {e}")
+    exit()
+
+# Cliente do Redis
+try:
+    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    redis_client.ping()
+    print("✅ Conectado ao Redis com sucesso!")
+except Exception as e:
+    print(f"🚨 ERRO CRÍTICO ao conectar com o Redis: {e}")
+    redis_client = None
+
+# --- Função para Enviar Respostas via Evolution API ---
+def enviar_resposta_whatsapp(remetente_jid: str, texto_resposta: str):
+    """Envia a resposta gerada de volta para o usuário."""
+    url = f"{EVOLUTION_API_URL}/message/sendText/{EVOLUTION_INSTANCE_NAME}"
+    headers = {"Content-Type": "application/json", "apikey": EVOLUTION_API_KEY}
+    payload = {"number": remetente_jid, "text": texto_resposta}
+    
+    print(f"   -> Enviando resposta para {remetente_jid}...")
     try:
-        # Pega o tipo de evento
-        tipo_evento = evento.get("event")
-        instancia = evento.get("instance")
-        data_hora = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
+        response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=30)
+        response.raise_for_status()
+        print("   -> Resposta enviada com sucesso!")
+    except requests.exceptions.RequestException as e:
+        print(f"   🚨 Erro ao enviar resposta via Evolution API: {e}")
 
-        print(f"--- [ {data_hora} ] ---")
-        print(f"Instância: {instancia} | Evento: {tipo_evento}")
+# --- Aplicação FastAPI ---
+app = FastAPI(title="Chatbot WhatsApp com Gemini e Redis")
 
-        # Se for uma nova mensagem (MESSAGES_UPSERT)
-        if tipo_evento == "MESSAGES_UPSERT" and "data" in evento:
-            mensagem_data = evento["data"]
-            remetente = mensagem_data.get("key", {}).get("remoteJid", "N/A")
+@app.post("/")
+async def webhook_receiver(request: Request):
+    data = await request.json()
+    
+    if data.get("event") == "MESSAGES_UPSERT" and "data" in data:
+        mensagem_data = data["data"]
+        
+        if not mensagem_data.get("key", {}).get("fromMe", False):
+            remetente_jid = mensagem_data.get("key", {}).get("remoteJid")
             
-            # Tenta encontrar o conteúdo da mensagem
-            conteudo = (
+            if remetente_jid != TARGET_JID:
+                print(f"   -> Mensagem de {remetente_jid} ignorada (não é o contato alvo).")
+                return {"status": "ignorado"}
+
+            nova_mensagem_texto = (
                 mensagem_data.get("message", {}).get("extendedTextMessage", {}).get("text") or
                 mensagem_data.get("message", {}).get("conversation", "")
             )
-            
-            print(f"De: {remetente}")
-            print(f"Mensagem: {conteudo}")
-        
-        # Se for uma atualização de status (MESSAGES_UPDATE)
-        elif tipo_evento == "MESSAGES_UPDATE" and "data" in evento:
-            status_data = evento["data"][0] # Geralmente vem em uma lista
-            status = status_data.get("status")
-            msg_id = status_data.get("key", {}).get("id")
-            print(f"Status da Mensagem ID {msg_id} atualizado para: {status}")
 
-        # Para outros eventos, apenas imprime o JSON completo
-        else:
-            print(json.dumps(evento, indent=2))
-            
-        print("-------------------------------------------\n")
+            print(f"\n--- Mensagem Recebida de {remetente_jid} ---")
+            print(f"Mensagem: {nova_mensagem_texto}")
 
-    except Exception as e:
-        print(f"🚨 Erro ao formatar o webhook: {e}")
-        # Em caso de erro, imprime o dado bruto
-        print(json.dumps(evento, indent=2))
+            if redis_client:
+                history_key = f"history:{remetente_jid}"
+                
+                try:
+                    conversa_json = redis_client.get(history_key)
+                    historico_conversa = json.loads(conversa_json) if conversa_json else []
+                    print(f"   -> Histórico recuperado: {len(historico_conversa)} turnos.")
+                    
+                    historico_conversa.append({'role': 'user', 'parts': [{'text': nova_mensagem_texto}]})
+                    
+                    print("   -> Enviando para o Gemini...")
+                    chat = model.start_chat(history=historico_conversa)
+                    resposta_gemini = chat.send_message(nova_mensagem_texto)
+                    texto_resposta = resposta_gemini.text
+                    print(f"   -> Resposta do Gemini: {texto_resposta}")
 
+                    historico_conversa.append({'role': 'model', 'parts': [{'text': texto_resposta}]})
+                    
+                    redis_client.set(history_key, json.dumps(historico_conversa))
+                    print("   -> Histórico atualizado no Redis.")
 
-@app.post(
-    "/", 
-    summary="Receptor de Webhooks",
-    description="Recebe notificações POST da Evolution API e as exibe no log."
-)
-async def webhook_receiver(request: Request):
-    """
-    Recebe um webhook, formata e imprime seu conteúdo, e retorna uma confirmação.
-    """
-    try:
-        data = await request.json()
-        formatar_evento_webhook(data)
-        return {"status": "sucesso", "message": "Webhook recebido corretamente."}
-    except json.JSONDecodeError:
-        print("🚨 Erro: Não foi possível decodificar o corpo da requisição como JSON.")
-        raise HTTPException(status_code=400, detail="Corpo da requisição inválido.")
+                    enviar_resposta_whatsapp(remetente_jid, texto_resposta)
 
-@app.get(
-    "/health",
-    summary="Verificação de Saúde",
-    description="Endpoint para verificar se o servidor está online."
-)
+                except Exception as e:
+                    print(f"   🚨 Erro no ciclo do chatbot: {e}")
+    
+    return {"status": "recebido"}
+
+@app.get("/health")
 def health_check():
     return {"status": "ok"}
 
-# O Railway usará o Procfile para iniciar, mas este bloco é útil para testes locais
-if __name__ == '__main__':
-    import uvicorn
-    port = int(os.environ.get('PORT', 5000))
-    uvicorn.run(app, host='0.0.0.0', port=port)
