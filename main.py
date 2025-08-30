@@ -80,7 +80,7 @@ async def webhook_connection_update(request: Request):
 async def webhook_receiver(request: Request):
     data = await request.json()
     
-    if data.get("event") != "MESSAGES_UPSERT":
+    if data.get("event") != "messages.upsert":
         return {"status": "evento_ignorado", "reason": "nao_e_messages_upsert"}
 
     mensagem_data = data.get("data")
