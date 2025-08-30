@@ -193,14 +193,13 @@ async def webhook_receiver(request: Request):
         print(f"\n--- Mensagem de Texto Recebida de {remetente_jid} ---")
         print(f"Mensagem: {nova_mensagem_texto}")
 
-    # --- ALTERADO: Lógica de áudio para usar o método INLINE ---
+    # --- CORRIGIDO: Lógica de áudio para usar um dicionário em vez de 'types.Part' ---
     elif "audioMessage" in message_obj:
         print(f"\n--- Mensagem de Áudio Recebida de {remetente_jid} ---")
         audio_info = message_obj["audioMessage"]
         audio_url = audio_info.get("url")
         if audio_url:
             try:
-                # 1. Baixar os dados brutos do áudio
                 async with httpx.AsyncClient() as client:
                     response = await client.get(audio_url)
                     response.raise_for_status()
@@ -209,32 +208,34 @@ async def webhook_receiver(request: Request):
                 mime_type = audio_info.get("mimetype", "audio/ogg")
                 print(f"   -> Áudio baixado ({len(audio_data)} bytes), tipo: {mime_type}.")
 
-                # 2. Criar um "Part" de áudio para envio inline (NÃO faz mais upload)
-                audio_part = types.Part.from_bytes(
-                    data=audio_data,
-                    mime_type=mime_type,
-                )
+                # Criar o "Part" de áudio usando um dicionário padrão do Python
+                audio_part = {
+                    "mime_type": mime_type,
+                    "data": audio_data
+                }
 
-                # 3. Solicitar transcrição com os dados inline
-                print("   -> Solicitando transcrição do áudio (método inline)...")
+                print("   -> Solicitando transcrição do áudio (método inline com dicionário)...")
                 prompt_transcricao = [
                     "Transcreva o conteúdo deste áudio.", 
-                    audio_part # Envia os dados brutos
+                    audio_part 
                 ]
                 resposta_transcricao = model.generate_content(prompt_transcricao)
                 
                 nova_mensagem_texto = resposta_transcricao.text.strip()
+                if not nova_mensagem_texto: # Se a transcrição vier vazia
+                    raise ValueError("A transcrição retornou um texto vazio.")
+
                 print(f"   -> Texto transcrito: '{nova_mensagem_texto}'")
 
             except Exception as e:
-                print(f"   🚨 Falha ao processar o áudio (método inline): {e}")
+                print(f"   🚨 Falha ao processar o áudio (método inline com dicionário): {e}")
                 await enviar_resposta_whatsapp(remetente_jid, "Desculpe, não consegui entender o seu áudio. Poderia tentar novamente ou digitar?")
                 return {"status": "erro_transcricao"}
 
     if not nova_mensagem_texto:
         return {"status": "ignorado_sem_conteudo_util"}
 
-    # --- Ciclo de resposta continua o mesmo, 100% texto ---
+    # --- Ciclo de resposta continua o mesmo ---
     try:
         historico_conversa = await obter_historico_conversa(remetente_jid)
         conteudo_para_gemini = historico_conversa
@@ -245,7 +246,6 @@ async def webhook_receiver(request: Request):
         texto_resposta = resposta_gemini.text
         print(f"   -> Resposta do Gemini: {texto_resposta}")
 
-        # ... (resto do código para enviar a resposta)
         tempo_de_espera = min(max(len(texto_resposta) * 0.06, 2), 8)
         await enviar_presenca(remetente_jid, "composing")
         await asyncio.sleep(tempo_de_espera)
@@ -254,7 +254,6 @@ async def webhook_receiver(request: Request):
 
     except Exception as e:
         print(f"   🚨 Erro no ciclo do chatbot: {e}")
-        # ... (resto do tratamento de erro)
         try:
             await enviar_resposta_whatsapp(remetente_jid, "Ocorreu um erro interno e não pude processar sua mensagem. Por favor, tente novamente.")
         except:
