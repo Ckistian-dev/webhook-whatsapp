@@ -6,6 +6,8 @@ from google.generativeai import types
 import asyncio
 from fastapi import FastAPI, Request, HTTPException
 from dotenv import load_dotenv
+import subprocess
+import os
 
 # --- Carregando as Configurações do .env ---
 load_dotenv()
@@ -168,74 +170,81 @@ async def webhook_connection_update(request: Request):
 async def webhook_receiver(request: Request):
     data = await request.json()
     
-    if data.get("event") != "messages.upsert":
-        return {"status": "evento_ignorado"}
-
+    # ... (verificações iniciais da função continuam iguais)
+    if data.get("event") != "messages.upsert": return {"status": "evento_ignorado"}
     mensagem_data = data.get("data")
-    if not mensagem_data or mensagem_data.get("key", {}).get("fromMe", False):
-        return {"status": "ignorado"}
-        
+    if not mensagem_data or mensagem_data.get("key", {}).get("fromMe", False): return {"status": "ignorado"}
     remetente_jid = mensagem_data.get("key", {}).get("remoteJid")
-    if not remetente_jid or remetente_jid != TARGET_JID:
-        return {"status": "ignorado"}
-
+    if not remetente_jid or remetente_jid != TARGET_JID: return {"status": "ignorado"}
     message_obj = mensagem_data.get("message", {})
-    if "ephemeralMessage" in message_obj:
-        message_obj = message_obj.get("ephemeralMessage", {}).get("message", {})
+    if "ephemeralMessage" in message_obj: message_obj = message_obj.get("ephemeralMessage", {}).get("message", {})
 
     nova_mensagem_texto = None
 
     if "extendedTextMessage" in message_obj or "conversation" in message_obj:
-        nova_mensagem_texto = (
-            message_obj.get("extendedTextMessage", {}).get("text") or
-            message_obj.get("conversation", "")
-        ).strip()
+        nova_mensagem_texto = (message_obj.get("extendedTextMessage", {}).get("text") or message_obj.get("conversation", "")).strip()
         print(f"\n--- Mensagem de Texto Recebida de {remetente_jid} ---")
         print(f"Mensagem: {nova_mensagem_texto}")
 
-    # --- CORRIGIDO: Lógica de áudio para usar um dicionário em vez de 'types.Part' ---
+    # --- LÓGICA FINAL: CONVERSÃO COM FFMPEG ---
     elif "audioMessage" in message_obj:
         print(f"\n--- Mensagem de Áudio Recebida de {remetente_jid} ---")
         audio_info = message_obj["audioMessage"]
         audio_url = audio_info.get("url")
         if audio_url:
+            caminho_audio_ogg = "audio_recebido.ogg"
+            caminho_audio_mp3 = "audio_convertido.mp3"
             try:
+                # 1. Baixar e salvar o áudio original .ogg
                 async with httpx.AsyncClient() as client:
                     response = await client.get(audio_url)
                     response.raise_for_status()
-                    audio_data = response.content
-                
-                mime_type = audio_info.get("mimetype", "audio/ogg")
-                print(f"   -> Áudio baixado ({len(audio_data)} bytes), tipo: {mime_type}.")
+                    with open(caminho_audio_ogg, "wb") as f:
+                        f.write(response.content)
+                print(f"   -> Áudio .ogg baixado com sucesso.")
 
-                # Criar o "Part" de áudio usando um dicionário padrão do Python
-                audio_part = {
-                    "mime_type": mime_type,
-                    "data": audio_data
-                }
-
-                print("   -> Solicitando transcrição do áudio (método inline com dicionário)...")
-                prompt_transcricao = [
-                    "Transcreva o conteúdo deste áudio.", 
-                    audio_part 
+                # 2. Usar FFmpeg para converter .ogg para .mp3
+                print("   -> Convertendo áudio para .mp3 usando FFmpeg...")
+                comando_ffmpeg = [
+                    "ffmpeg", "-y", "-i", caminho_audio_ogg,
+                    "-acodec", "libmp3lame", "-b:a", "128k",
+                    caminho_audio_mp3
                 ]
-                resposta_transcricao = model.generate_content(prompt_transcricao)
+                subprocess.run(comando_ffmpeg, check=True, capture_output=True)
+                print("   -> Conversão para .mp3 concluída.")
                 
-                nova_mensagem_texto = resposta_transcricao.text.strip()
-                if not nova_mensagem_texto: # Se a transcrição vier vazia
-                    raise ValueError("A transcrição retornou um texto vazio.")
+                # 3. Ler os bytes do novo arquivo .mp3
+                with open(caminho_audio_mp3, "rb") as f:
+                    audio_data = f.read()
 
+                # 4. Enviar o áudio .mp3 para o Gemini
+                audio_part = {"mime_type": "audio/mp3", "data": audio_data}
+
+                print("   -> Solicitando transcrição do áudio .mp3...")
+                resposta_transcricao = model.generate_content(["Transcreva este áudio.", audio_part])
+                nova_mensagem_texto = resposta_transcricao.text.strip()
+                if not nova_mensagem_texto: raise ValueError("A transcrição retornou um texto vazio.")
                 print(f"   -> Texto transcrito: '{nova_mensagem_texto}'")
 
+            except FileNotFoundError:
+                print("   🚨 ERRO CRÍTICO: O comando 'ffmpeg' não foi encontrado. Ele está instalado no servidor?")
+                await enviar_resposta_whatsapp(remetente_jid, "Desculpe, meu sistema de áudio não está configurado corretamente. Por favor, avise o administrador.")
+                return {"status": "erro_ffmpeg_nao_encontrado"}
+            except subprocess.CalledProcessError as e:
+                print(f"   🚨 ERRO: O FFmpeg falhou ao converter o áudio. Erro: {e.stderr.decode()}")
+                await enviar_resposta_whatsapp(remetente_jid, "Desculpe, não consegui processar o formato deste áudio.")
+                return {"status": "erro_conversao_ffmpeg"}
             except Exception as e:
-                print(f"   🚨 Falha ao processar o áudio (método inline com dicionário): {e}")
+                print(f"   🚨 Falha no pipeline de conversão de áudio: {e}")
                 await enviar_resposta_whatsapp(remetente_jid, "Desculpe, não consegui entender o seu áudio. Poderia tentar novamente ou digitar?")
                 return {"status": "erro_transcricao"}
+            finally:
+                # Limpa os arquivos de áudio temporários
+                if os.path.exists(caminho_audio_ogg): os.remove(caminho_audio_ogg)
+                if os.path.exists(caminho_audio_mp3): os.remove(caminho_audio_mp3)
 
-    if not nova_mensagem_texto:
-        return {"status": "ignorado_sem_conteudo_util"}
-
-    # --- Ciclo de resposta continua o mesmo ---
+    # --- Ciclo de resposta (sem alterações) ---
+    if not nova_mensagem_texto: return {"status": "ignorado_sem_conteudo_util"}
     try:
         historico_conversa = await obter_historico_conversa(remetente_jid)
         conteudo_para_gemini = historico_conversa
@@ -255,9 +264,8 @@ async def webhook_receiver(request: Request):
     except Exception as e:
         print(f"   🚨 Erro no ciclo do chatbot: {e}")
         try:
-            await enviar_resposta_whatsapp(remetente_jid, "Ocorreu um erro interno e não pude processar sua mensagem. Por favor, tente novamente.")
-        except:
-            pass
+            await enviar_resposta_whatsapp(remetente_jid, "Ocorreu um erro interno e não pude processar sua mensagem.")
+        except: pass
         raise HTTPException(status_code=500, detail=f"Erro interno no processamento do chatbot: {e}")
     
     return {"status": "recebido_e_processado"}
