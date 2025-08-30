@@ -2,12 +2,12 @@ import os
 import json
 import httpx
 import google.generativeai as genai
-from google.generativeai import types
 import asyncio
 from fastapi import FastAPI, Request, HTTPException
 from dotenv import load_dotenv
 import subprocess
 import os
+import base64
 
 # --- Carregando as Configurações do .env ---
 load_dotenv()
@@ -170,12 +170,12 @@ async def webhook_connection_update(request: Request):
 async def webhook_receiver(request: Request):
     data = await request.json()
     
-    # ... (verificações iniciais da função continuam iguais)
     if data.get("event") != "messages.upsert": return {"status": "evento_ignorado"}
     mensagem_data = data.get("data")
     if not mensagem_data or mensagem_data.get("key", {}).get("fromMe", False): return {"status": "ignorado"}
     remetente_jid = mensagem_data.get("key", {}).get("remoteJid")
     if not remetente_jid or remetente_jid != TARGET_JID: return {"status": "ignorado"}
+    
     message_obj = mensagem_data.get("message", {})
     if "ephemeralMessage" in message_obj: message_obj = message_obj.get("ephemeralMessage", {}).get("message", {})
 
@@ -186,71 +186,68 @@ async def webhook_receiver(request: Request):
         print(f"\n--- Mensagem de Texto Recebida de {remetente_jid} ---")
         print(f"Mensagem: {nova_mensagem_texto}")
 
-    # --- VERSÃO FINAL E ROBUSTA DO PROCESSAMENTO DE ÁUDIO ---
     elif "audioMessage" in message_obj:
         print(f"\n--- Mensagem de Áudio Recebida de {remetente_jid} ---")
-        audio_info = message_obj["audioMessage"]
-        audio_url = audio_info.get("url")
-        if audio_url:
-            caminho_audio_ogg = "audio_recebido.ogg"
-            caminho_audio_mp3 = "audio_convertido.mp3"
-            try:
-                # 1. Usar streaming para baixar o áudio de forma mais confiável
-                print("   -> Baixando áudio .ogg (modo streaming)...")
-                async with httpx.AsyncClient() as client:
-                    async with client.stream("GET", audio_url) as response:
-                        response.raise_for_status()
-                        with open(caminho_audio_ogg, "wb") as f:
-                            async for chunk in response.aiter_bytes():
-                                f.write(chunk)
-                
-                # 2. VERIFICAÇÃO CRÍTICA: Garantir que o arquivo não está vazio
-                if not os.path.exists(caminho_audio_ogg) or os.path.getsize(caminho_audio_ogg) == 0:
-                    raise ValueError("O download resultou em um arquivo vazio.")
-                
-                print(f"   -> Áudio .ogg baixado com sucesso ({os.path.getsize(caminho_audio_ogg)} bytes).")
+        
+        # NOVO: Obter o ID da mensagem para usar no endpoint correto
+        message_id = mensagem_data.get("key", {}).get("id")
+        if not message_id:
+            print("   🚨 ERRO: Não foi possível encontrar o ID da mensagem de áudio.")
+            return {"status": "erro_sem_id"}
 
-                # 3. Usar FFmpeg para converter .ogg para .mp3
-                print("   -> Convertendo áudio para .mp3 usando FFmpeg...")
-                comando_ffmpeg = [
-                    "ffmpeg", "-y", "-i", caminho_audio_ogg,
-                    "-acodec", "libmp3lame", "-b:a", "128k",
-                    caminho_audio_mp3
-                ]
-                subprocess.run(comando_ffmpeg, check=True, capture_output=True, text=True)
-                print("   -> Conversão para .mp3 concluída.")
-                
-                # 4. Ler os bytes do novo arquivo .mp3
-                with open(caminho_audio_mp3, "rb") as f:
-                    audio_data = f.read()
+        caminho_audio_ogg = "audio_recebido.ogg"
+        caminho_audio_mp3 = "audio_convertido.mp3"
+        try:
+            # NOVO: Chamar o endpoint getBase64FromMediaMessage para obter o áudio decifrado
+            print(f"   -> Buscando áudio decifrado para a mensagem ID: {message_id}...")
+            url_get_media = f"{EVOLUTION_API_URL}/chat/getBase64FromMediaMessage/{EVOLUTION_INSTANCE_NAME}"
+            payload_get_media = {"message": {"key": {"id": message_id}}}
+            headers = {"Content-Type": "application/json", "apikey": EVOLUTION_API_KEY}
 
-                # 5. Enviar o áudio .mp3 para o Gemini
-                audio_part = {"mime_type": "audio/mp3", "data": audio_data}
-                print("   -> Solicitando transcrição do áudio .mp3...")
-                resposta_transcricao = model.generate_content(["Transcreva este áudio.", audio_part])
-                nova_mensagem_texto = resposta_transcricao.text.strip()
-                if not nova_mensagem_texto: raise ValueError("A transcrição retornou um texto vazio.")
-                print(f"   -> Texto transcrito: '{nova_mensagem_texto}'")
+            async with httpx.AsyncClient() as client:
+                response = await client.post(url_get_media, json=payload_get_media, headers=headers, timeout=60)
+                response.raise_for_status()
+                media_response = response.json()
+            
+            # NOVO: Decodificar o áudio de Base64 para bytes
+            # A chave pode ser 'base64', 'media' ou 'data'. Ajuste se necessário.
+            base64_audio = media_response.get("base64") 
+            if not base64_audio:
+                raise ValueError("A resposta da API de mídia não continha a chave 'base64'.")
 
-            except ValueError as e:
-                print(f"   🚨 ERRO de Validação: {e}")
-                await enviar_resposta_whatsapp(remetente_jid, "Desculpe, não consegui obter o conteúdo do seu áudio. A URL pode ter expirado.")
-                return {"status": "erro_download_vazio"}
-            except FileNotFoundError:
-                print("   🚨 ERRO CRÍTICO: O comando 'ffmpeg' não foi encontrado. Ele está instalado no servidor?")
-                await enviar_resposta_whatsapp(remetente_jid, "Desculpe, meu sistema de áudio não está configurado corretamente. Por favor, avise o administrador.")
-                return {"status": "erro_ffmpeg_nao_encontrado"}
-            except subprocess.CalledProcessError as e:
-                print(f"   🚨 ERRO: O FFmpeg falhou ao converter o áudio. Erro: {e.stderr}")
-                await enviar_resposta_whatsapp(remetente_jid, "Desculpe, não consegui processar o formato deste áudio.")
-                return {"status": "erro_conversao_ffmpeg"}
-            except Exception as e:
-                print(f"   🚨 Falha no pipeline de conversão de áudio: {e}")
-                await enviar_resposta_whatsapp(remetente_jid, "Desculpe, não consegui entender o seu áudio. Poderia tentar novamente ou digitar?")
-                return {"status": "erro_transcricao"}
-            finally:
-                if os.path.exists(caminho_audio_ogg): os.remove(caminho_audio_ogg)
-                if os.path.exists(caminho_audio_mp3): os.remove(caminho_audio_mp3)
+            audio_data = base64.b64decode(base64_audio)
+            
+            # Salvar os bytes decifrados no arquivo .ogg
+            with open(caminho_audio_ogg, "wb") as f:
+                f.write(audio_data)
+            
+            if os.path.getsize(caminho_audio_ogg) == 0:
+                raise ValueError("O áudio decifrado resultou em um arquivo vazio.")
+            print(f"   -> Áudio decifrado e salvo com sucesso ({os.path.getsize(caminho_audio_ogg)} bytes).")
+
+            # A partir daqui, o processo de conversão com FFmpeg continua o mesmo
+            print("   -> Convertendo áudio para .mp3 usando FFmpeg...")
+            comando_ffmpeg = ["ffmpeg", "-y", "-i", caminho_audio_ogg, "-acodec", "libmp3lame", "-b:a", "128k", caminho_audio_mp3]
+            subprocess.run(comando_ffmpeg, check=True, capture_output=True, text=True)
+            print("   -> Conversão para .mp3 concluída.")
+            
+            with open(caminho_audio_mp3, "rb") as f:
+                mp3_audio_data = f.read()
+
+            audio_part = {"mime_type": "audio/mp3", "data": mp3_audio_data}
+            print("   -> Solicitando transcrição do áudio .mp3...")
+            resposta_transcricao = model.generate_content(["Transcreva este áudio.", audio_part])
+            nova_mensagem_texto = resposta_transcricao.text.strip()
+            if not nova_mensagem_texto: raise ValueError("A transcrição retornou um texto vazio.")
+            print(f"   -> Texto transcrito: '{nova_mensagem_texto}'")
+
+        except Exception as e:
+            print(f"   🚨 Falha no pipeline de processamento de áudio: {e}")
+            await enviar_resposta_whatsapp(remetente_jid, "Desculpe, não consegui processar seu áudio desta vez.")
+            return {"status": "erro_processamento_audio"}
+        finally:
+            if os.path.exists(caminho_audio_ogg): os.remove(caminho_audio_ogg)
+            if os.path.exists(caminho_audio_mp3): os.remove(caminho_audio_mp3)
 
     # --- Ciclo de resposta (sem alterações) ---
     if not nova_mensagem_texto: return {"status": "ignorado_sem_conteudo_util"}
@@ -258,7 +255,6 @@ async def webhook_receiver(request: Request):
         historico_conversa = await obter_historico_conversa(remetente_jid)
         conteudo_para_gemini = historico_conversa
         conteudo_para_gemini.append({'role': 'user', 'parts': [{'text': nova_mensagem_texto}]})
-
         print("   -> Enviando contexto de texto para o Gemini gerar resposta...")
         resposta_gemini = model.generate_content(conteudo_para_gemini)
         texto_resposta = resposta_gemini.text
