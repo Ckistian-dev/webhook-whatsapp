@@ -184,9 +184,8 @@ async def webhook_receiver(request: Request):
     if "ephemeralMessage" in message_obj:
         message_obj = message_obj.get("ephemeralMessage", {}).get("message", {})
 
-    # ALTERADO: Lógica para extrair texto OU áudio
     nova_mensagem_texto = None
-    arquivo_audio = None
+    arquivo_audio_gemini = None # Variável para o arquivo enviado ao Gemini
 
     if "extendedTextMessage" in message_obj or "conversation" in message_obj:
         nova_mensagem_texto = (
@@ -202,55 +201,59 @@ async def webhook_receiver(request: Request):
         audio_url = audio_info.get("url")
         if audio_url:
             try:
+                # 1. Baixar o áudio
                 async with httpx.AsyncClient() as client:
                     response = await client.get(audio_url)
                     response.raise_for_status()
                     audio_data = response.content
-                    mime_type = audio_info.get("mimetype", "audio/ogg")
-                    
-                    arquivo_audio = genai.upload_file(
-                        path="audio.ogg", # Nome temporário
-                        display_name="Mensagem de Voz",
-                        mime_type=mime_type
-                    )
-                    # Reescreve o arquivo localmente para enviar
-                    with open("audio.ogg", "wb") as f:
-                        f.write(audio_data)
+                
+                caminho_arquivo_audio = "audio_recebido.ogg"
+                
+                # 2. Salvar o áudio em um arquivo local PRIMEIRO
+                with open(caminho_arquivo_audio, "wb") as f:
+                    f.write(audio_data)
+                
+                print(f"   -> Áudio baixado ({len(audio_data)} bytes) e salvo localmente.")
 
-                    print(f"   -> Áudio baixado ({len(audio_data)} bytes) e preparado para o Gemini.")
+                # 3. AGORA, fazer o upload do arquivo que já existe
+                arquivo_audio_gemini = genai.upload_file(
+                    path=caminho_arquivo_audio,
+                    display_name="MensagemDeVozWhatsApp"
+                )
+                
+                print("   -> Arquivo de áudio enviado para a API do Gemini com sucesso.")
+
             except Exception as e:
                 print(f"   🚨 Falha ao baixar ou preparar o áudio: {e}")
-                # Envia uma mensagem de erro para o usuário
                 await enviar_resposta_whatsapp(remetente_jid, "Desculpe, não consegui processar seu áudio. Tente novamente.")
                 return {"status": "erro_audio"}
 
-    if not nova_mensagem_texto and not arquivo_audio:
+    if not nova_mensagem_texto and not arquivo_audio_gemini:
         return {"status": "ignorado_sem_conteudo"}
 
     try:
         historico_conversa = await obter_historico_conversa(remetente_jid)
         
-        # ALTERADO: Monta o conteúdo para o Gemini (texto, áudio ou ambos)
-        conteudo_para_gemini = []
+        # O histórico já vem formatado, então podemos usá-lo diretamente
+        # A nova API `generate_content` aceita o histórico neste formato diretamente
+        conteudo_para_gemini = historico_conversa
         
-        # Adiciona o histórico de texto anterior
-        for item in historico_conversa:
-            conteudo_para_gemini.extend(item['parts'])
-
         # Prepara a mensagem atual
-        prompt_atual = "Responda a esta mensagem: "
+        partes_mensagem_atual = []
         if nova_mensagem_texto:
-            conteudo_para_gemini.append({'text': nova_mensagem_texto})
-        if arquivo_audio:
+            partes_mensagem_atual.append({'text': nova_mensagem_texto})
+        
+        if arquivo_audio_gemini:
             # Pede para o modelo transcrever e responder
             prompt_transcricao = "Transcreva o áudio a seguir e, em seguida, responda ao que foi dito de forma apropriada:"
-            conteudo_para_gemini.append({'text': prompt_transcricao})
-            conteudo_para_gemini.append(arquivo_audio)
-
+            partes_mensagem_atual.append({'text': prompt_transcricao})
+            partes_mensagem_atual.append(arquivo_audio_gemini)
+        
+        conteudo_para_gemini.append({'role': 'user', 'parts': partes_mensagem_atual})
 
         print("   -> Enviando para o Gemini...")
         
-        # ALTERADO: Usa generate_content que é mais flexível para multimodal
+        # Usa generate_content que é mais flexível para multimodal
         resposta_gemini = model.generate_content(conteudo_para_gemini)
         
         texto_resposta = resposta_gemini.text
@@ -266,6 +269,12 @@ async def webhook_receiver(request: Request):
 
     except Exception as e:
         print(f"   🚨 Erro no ciclo do chatbot: {e}")
-        raise HTTPException(status_code=500, detail="Erro interno no processamento do chatbot")
+        # Tenta dar uma resposta de erro para o usuário
+        try:
+            await enviar_resposta_whatsapp(remetente_jid, "Ocorreu um erro interno e não pude processar sua mensagem. Por favor, tente novamente.")
+        except:
+            pass # Se até o envio de erro falhar, apenas loga no servidor
+        
+        raise HTTPException(status_code=500, detail=f"Erro interno no processamento do chatbot: {e}")
     
     return {"status": "recebido_e_processado"}
