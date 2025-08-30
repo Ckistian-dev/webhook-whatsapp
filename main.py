@@ -202,8 +202,9 @@ async def webhook_receiver(request: Request):
         audio_info = message_obj["audioMessage"]
         audio_url = audio_info.get("url")
         if audio_url:
+            arquivo_audio_gemini = None
             try:
-                # Baixa e salva o áudio (como antes)
+                # Baixa e salva o áudio
                 async with httpx.AsyncClient() as client:
                     response = await client.get(audio_url)
                     response.raise_for_status()
@@ -213,27 +214,33 @@ async def webhook_receiver(request: Request):
                 with open(caminho_arquivo_audio, "wb") as f:
                     f.write(audio_data)
                 
-                # Faz o upload do arquivo para o Gemini (como antes)
+                # Faz o upload do arquivo para o Gemini
                 arquivo_audio_gemini = genai.upload_file(
                     path=caminho_arquivo_audio,
                     display_name="MensagemDeVozWhatsApp"
                 )
                 print("   -> Arquivo de áudio enviado para a API do Gemini.")
 
-                # ETAPA DE TRANSCRIÇÃO: Primeira chamada ao Gemini
+            except Exception as e:
+                print(f"   🚨 Falha durante o download ou upload do áudio: {e}")
+                await enviar_resposta_whatsapp(remetente_jid, "Desculpe, tive um problema ao receber seu áudio. Por favor, tente novamente.")
+                return {"status": "erro_upload_audio"}
+
+            # Etapa de Transcrição
+            try:
                 print("   -> Solicitando transcrição do áudio...")
                 prompt_transcricao = [
-                    "Transcreva o conteúdo deste áudio em uma única linha, sem adicionar nenhuma outra palavra ou formatação.", 
+                    "Transcreva o conteúdo deste áudio.", 
                     arquivo_audio_gemini
                 ]
                 resposta_transcricao = model.generate_content(prompt_transcricao)
                 
-                # O resultado da transcrição se torna a "nova mensagem"
                 nova_mensagem_texto = resposta_transcricao.text.strip()
                 print(f"   -> Texto transcrito: '{nova_mensagem_texto}'")
 
             except Exception as e:
-                print(f"   🚨 Falha ao transcrever o áudio: {e}")
+                # Erro específico da transcrição
+                print(f"   🚨 Falha ao transcrever o áudio na API Gemini: {e}")
                 await enviar_resposta_whatsapp(remetente_jid, "Desculpe, não consegui entender o seu áudio. Poderia tentar novamente ou digitar?")
                 return {"status": "erro_transcricao"}
 
