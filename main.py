@@ -186,7 +186,7 @@ async def webhook_receiver(request: Request):
         print(f"\n--- Mensagem de Texto Recebida de {remetente_jid} ---")
         print(f"Mensagem: {nova_mensagem_texto}")
 
-    # --- LÓGICA FINAL: CONVERSÃO COM FFMPEG ---
+    # --- VERSÃO FINAL E ROBUSTA DO PROCESSAMENTO DE ÁUDIO ---
     elif "audioMessage" in message_obj:
         print(f"\n--- Mensagem de Áudio Recebida de {remetente_jid} ---")
         audio_info = message_obj["audioMessage"]
@@ -195,43 +195,53 @@ async def webhook_receiver(request: Request):
             caminho_audio_ogg = "audio_recebido.ogg"
             caminho_audio_mp3 = "audio_convertido.mp3"
             try:
-                # 1. Baixar e salvar o áudio original .ogg
+                # 1. Usar streaming para baixar o áudio de forma mais confiável
+                print("   -> Baixando áudio .ogg (modo streaming)...")
                 async with httpx.AsyncClient() as client:
-                    response = await client.get(audio_url)
-                    response.raise_for_status()
-                    with open(caminho_audio_ogg, "wb") as f:
-                        f.write(response.content)
-                print(f"   -> Áudio .ogg baixado com sucesso.")
+                    async with client.stream("GET", audio_url) as response:
+                        response.raise_for_status()
+                        with open(caminho_audio_ogg, "wb") as f:
+                            async for chunk in response.aiter_bytes():
+                                f.write(chunk)
+                
+                # 2. VERIFICAÇÃO CRÍTICA: Garantir que o arquivo não está vazio
+                if not os.path.exists(caminho_audio_ogg) or os.path.getsize(caminho_audio_ogg) == 0:
+                    raise ValueError("O download resultou em um arquivo vazio.")
+                
+                print(f"   -> Áudio .ogg baixado com sucesso ({os.path.getsize(caminho_audio_ogg)} bytes).")
 
-                # 2. Usar FFmpeg para converter .ogg para .mp3
+                # 3. Usar FFmpeg para converter .ogg para .mp3
                 print("   -> Convertendo áudio para .mp3 usando FFmpeg...")
                 comando_ffmpeg = [
                     "ffmpeg", "-y", "-i", caminho_audio_ogg,
                     "-acodec", "libmp3lame", "-b:a", "128k",
                     caminho_audio_mp3
                 ]
-                subprocess.run(comando_ffmpeg, check=True, capture_output=True)
+                subprocess.run(comando_ffmpeg, check=True, capture_output=True, text=True)
                 print("   -> Conversão para .mp3 concluída.")
                 
-                # 3. Ler os bytes do novo arquivo .mp3
+                # 4. Ler os bytes do novo arquivo .mp3
                 with open(caminho_audio_mp3, "rb") as f:
                     audio_data = f.read()
 
-                # 4. Enviar o áudio .mp3 para o Gemini
+                # 5. Enviar o áudio .mp3 para o Gemini
                 audio_part = {"mime_type": "audio/mp3", "data": audio_data}
-
                 print("   -> Solicitando transcrição do áudio .mp3...")
                 resposta_transcricao = model.generate_content(["Transcreva este áudio.", audio_part])
                 nova_mensagem_texto = resposta_transcricao.text.strip()
                 if not nova_mensagem_texto: raise ValueError("A transcrição retornou um texto vazio.")
                 print(f"   -> Texto transcrito: '{nova_mensagem_texto}'")
 
+            except ValueError as e:
+                print(f"   🚨 ERRO de Validação: {e}")
+                await enviar_resposta_whatsapp(remetente_jid, "Desculpe, não consegui obter o conteúdo do seu áudio. A URL pode ter expirado.")
+                return {"status": "erro_download_vazio"}
             except FileNotFoundError:
                 print("   🚨 ERRO CRÍTICO: O comando 'ffmpeg' não foi encontrado. Ele está instalado no servidor?")
                 await enviar_resposta_whatsapp(remetente_jid, "Desculpe, meu sistema de áudio não está configurado corretamente. Por favor, avise o administrador.")
                 return {"status": "erro_ffmpeg_nao_encontrado"}
             except subprocess.CalledProcessError as e:
-                print(f"   🚨 ERRO: O FFmpeg falhou ao converter o áudio. Erro: {e.stderr.decode()}")
+                print(f"   🚨 ERRO: O FFmpeg falhou ao converter o áudio. Erro: {e.stderr}")
                 await enviar_resposta_whatsapp(remetente_jid, "Desculpe, não consegui processar o formato deste áudio.")
                 return {"status": "erro_conversao_ffmpeg"}
             except Exception as e:
@@ -239,7 +249,6 @@ async def webhook_receiver(request: Request):
                 await enviar_resposta_whatsapp(remetente_jid, "Desculpe, não consegui entender o seu áudio. Poderia tentar novamente ou digitar?")
                 return {"status": "erro_transcricao"}
             finally:
-                # Limpa os arquivos de áudio temporários
                 if os.path.exists(caminho_audio_ogg): os.remove(caminho_audio_ogg)
                 if os.path.exists(caminho_audio_mp3): os.remove(caminho_audio_mp3)
 
