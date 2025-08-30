@@ -48,7 +48,16 @@ def enviar_resposta_whatsapp(remetente_jid: str, texto_resposta: str):
     """Envia a resposta gerada de volta para o usuário."""
     url = f"{EVOLUTION_API_URL}/message/sendText/{EVOLUTION_INSTANCE_NAME}"
     headers = {"Content-Type": "application/json", "apikey": EVOLUTION_API_KEY}
-    payload = {"number": remetente_jid, "options": {"delay": 1200}, "textMessage": {"text": texto_resposta}}
+    
+    # CORREÇÃO FINAL: Usando a estrutura de payload do seu script de teste funcional
+    payload = {
+        "number": remetente_jid,
+        "text": texto_resposta,
+        "options": {
+            "delay": 1200,
+            "presence": "composing"
+        }
+    }
     
     print(f"   -> Enviando resposta para {remetente_jid}...")
     try:
@@ -57,6 +66,12 @@ def enviar_resposta_whatsapp(remetente_jid: str, texto_resposta: str):
         print("   -> Resposta enviada com sucesso!")
     except requests.exceptions.RequestException as e:
         print(f"   🚨 Erro ao enviar resposta via Evolution API: {e}")
+        if e.response is not None:
+            print(f"   -> Status Code: {e.response.status_code}")
+            try:
+                print(f"   -> Resposta do Erro: {e.response.json()}")
+            except json.JSONDecodeError:
+                print(f"   -> Resposta do Erro (não-JSON): {e.response.text}")
 
 # --- Aplicação FastAPI ---
 app = FastAPI(title="Chatbot WhatsApp com Gemini e Redis")
