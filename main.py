@@ -2,9 +2,8 @@ import os
 import json
 import httpx
 import google.generativeai as genai
+from google.generativeai import types
 import asyncio
-import random
-import mimetypes # NOVO: Para identificar o tipo de arquivo de áudio
 from fastapi import FastAPI, Request, HTTPException
 from dotenv import load_dotenv
 
@@ -184,10 +183,8 @@ async def webhook_receiver(request: Request):
     if "ephemeralMessage" in message_obj:
         message_obj = message_obj.get("ephemeralMessage", {}).get("message", {})
 
-    # --- LÓGICA DE EXTRAÇÃO E TRANSCRIÇÃO ---
     nova_mensagem_texto = None
 
-    # 1. Processa mensagens de texto diretamente
     if "extendedTextMessage" in message_obj or "conversation" in message_obj:
         nova_mensagem_texto = (
             message_obj.get("extendedTextMessage", {}).get("text") or
@@ -196,42 +193,33 @@ async def webhook_receiver(request: Request):
         print(f"\n--- Mensagem de Texto Recebida de {remetente_jid} ---")
         print(f"Mensagem: {nova_mensagem_texto}")
 
-    # 2. Processa mensagens de áudio, convertendo para texto
+    # --- ALTERADO: Lógica de áudio para usar o método INLINE ---
     elif "audioMessage" in message_obj:
         print(f"\n--- Mensagem de Áudio Recebida de {remetente_jid} ---")
         audio_info = message_obj["audioMessage"]
         audio_url = audio_info.get("url")
         if audio_url:
-            arquivo_audio_gemini = None
             try:
-                # Baixa e salva o áudio
+                # 1. Baixar os dados brutos do áudio
                 async with httpx.AsyncClient() as client:
                     response = await client.get(audio_url)
                     response.raise_for_status()
                     audio_data = response.content
                 
-                caminho_arquivo_audio = "audio_recebido.ogg"
-                with open(caminho_arquivo_audio, "wb") as f:
-                    f.write(audio_data)
-                
-                # Faz o upload do arquivo para o Gemini
-                arquivo_audio_gemini = genai.upload_file(
-                    path=caminho_arquivo_audio,
-                    display_name="MensagemDeVozWhatsApp"
+                mime_type = audio_info.get("mimetype", "audio/ogg")
+                print(f"   -> Áudio baixado ({len(audio_data)} bytes), tipo: {mime_type}.")
+
+                # 2. Criar um "Part" de áudio para envio inline (NÃO faz mais upload)
+                audio_part = types.Part.from_bytes(
+                    data=audio_data,
+                    mime_type=mime_type,
                 )
-                print("   -> Arquivo de áudio enviado para a API do Gemini.")
 
-            except Exception as e:
-                print(f"   🚨 Falha durante o download ou upload do áudio: {e}")
-                await enviar_resposta_whatsapp(remetente_jid, "Desculpe, tive um problema ao receber seu áudio. Por favor, tente novamente.")
-                return {"status": "erro_upload_audio"}
-
-            # Etapa de Transcrição
-            try:
-                print("   -> Solicitando transcrição do áudio...")
+                # 3. Solicitar transcrição com os dados inline
+                print("   -> Solicitando transcrição do áudio (método inline)...")
                 prompt_transcricao = [
                     "Transcreva o conteúdo deste áudio.", 
-                    arquivo_audio_gemini
+                    audio_part # Envia os dados brutos
                 ]
                 resposta_transcricao = model.generate_content(prompt_transcricao)
                 
@@ -239,34 +227,26 @@ async def webhook_receiver(request: Request):
                 print(f"   -> Texto transcrito: '{nova_mensagem_texto}'")
 
             except Exception as e:
-                # Erro específico da transcrição
-                print(f"   🚨 Falha ao transcrever o áudio na API Gemini: {e}")
+                print(f"   🚨 Falha ao processar o áudio (método inline): {e}")
                 await enviar_resposta_whatsapp(remetente_jid, "Desculpe, não consegui entender o seu áudio. Poderia tentar novamente ou digitar?")
                 return {"status": "erro_transcricao"}
 
-    # Se não houver texto (nem original, nem transcrito), ignora.
     if not nova_mensagem_texto:
         return {"status": "ignorado_sem_conteudo_util"}
 
-    # --- CICLO DE RESPOSTA UNIFICADO (AGORA SÓ LIDA COM TEXTO) ---
+    # --- Ciclo de resposta continua o mesmo, 100% texto ---
     try:
-        # Busca o histórico da conversa
         historico_conversa = await obter_historico_conversa(remetente_jid)
-        
-        # Adiciona a mensagem de texto atual (ou a recém-transcrita) ao histórico
         conteudo_para_gemini = historico_conversa
         conteudo_para_gemini.append({'role': 'user', 'parts': [{'text': nova_mensagem_texto}]})
 
         print("   -> Enviando contexto de texto para o Gemini gerar resposta...")
-        
-        # Segunda chamada ao Gemini, agora 100% baseada em texto
         resposta_gemini = model.generate_content(conteudo_para_gemini)
         texto_resposta = resposta_gemini.text
         print(f"   -> Resposta do Gemini: {texto_resposta}")
 
-        # Simula digitação e envia a resposta
+        # ... (resto do código para enviar a resposta)
         tempo_de_espera = min(max(len(texto_resposta) * 0.06, 2), 8)
-        
         await enviar_presenca(remetente_jid, "composing")
         await asyncio.sleep(tempo_de_espera)
         await enviar_presenca(remetente_jid, "paused")
@@ -274,11 +254,11 @@ async def webhook_receiver(request: Request):
 
     except Exception as e:
         print(f"   🚨 Erro no ciclo do chatbot: {e}")
+        # ... (resto do tratamento de erro)
         try:
             await enviar_resposta_whatsapp(remetente_jid, "Ocorreu um erro interno e não pude processar sua mensagem. Por favor, tente novamente.")
         except:
             pass
-        
         raise HTTPException(status_code=500, detail=f"Erro interno no processamento do chatbot: {e}")
     
     return {"status": "recebido_e_processado"}
