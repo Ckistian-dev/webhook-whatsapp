@@ -4,13 +4,14 @@ import httpx
 import google.generativeai as genai
 import asyncio
 import random
+import mimetypes # NOVO: Para identificar o tipo de arquivo de áudio
 from fastapi import FastAPI, Request, HTTPException
 from dotenv import load_dotenv
 
 # --- Carregando as Configurações do .env ---
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME")
+GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME") # Recomendo usar 'gemini-1.5-pro-latest' ou 'gemini-1.5-flash-latest' para áudio
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT")
 EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL")
 EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY")
@@ -41,7 +42,6 @@ def formatar_historico_para_gemini(mensagens_api: list):
     """Converte o histórico da API da Evolution para o formato do Gemini."""
     historico_formatado = []
     for msg in mensagens_api:
-        # Extrai o texto da mensagem, independentemente do formato
         message_obj = msg.get("message", {})
         if "ephemeralMessage" in message_obj:
             message_obj = message_obj.get("ephemeralMessage", {}).get("message", {})
@@ -54,7 +54,6 @@ def formatar_historico_para_gemini(mensagens_api: list):
         if not texto:
             continue
 
-        # Define o 'role' com base em quem enviou a mensagem
         role = "model" if msg.get("key", {}).get("fromMe") else "user"
         
         historico_formatado.append({
@@ -63,43 +62,52 @@ def formatar_historico_para_gemini(mensagens_api: list):
         })
     return historico_formatado
 
+# CORRIGIDO E MELHORADO: Função para obter histórico com paginação
 async def obter_historico_conversa(remetente_jid: str):
-    """Busca o histórico de mensagens da API da Evolution e formata para o Gemini."""
+    """Busca todo o histórico de mensagens da API da Evolution, lidando com paginação."""
     url = f"{EVOLUTION_API_URL}/chat/findMessages/{EVOLUTION_INSTANCE_NAME}"
     headers = {"Content-Type": "application/json", "apikey": EVOLUTION_API_KEY}
-    payload = {
-        "where": {
-            "key": {
-                "remoteJid": remetente_jid
-            }
-        }
-    }
     
-    print(f"   -> Buscando histórico completo de '{remetente_jid}' na API via POST...")
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, headers=headers, json=payload, timeout=30)
-            response.raise_for_status()
-            dados_brutos = response.json()
-            
-            # --- CORREÇÃO APLICADA AQUI ---
-            # Verifica se a resposta é um dicionário e extrai a lista de mensagens
-            if isinstance(dados_brutos, dict) and "messages" in dados_brutos:
-                mensagens_da_api = dados_brutos["messages"]
-            elif isinstance(dados_brutos, list):
-                mensagens_da_api = dados_brutos
-            else:
-                mensagens_da_api = []
-            # --------------------------------
+    historico_completo = []
+    pagina_atual = 1
+    total_paginas = 1  # Inicia com 1 para entrar no loop
 
-            # A API retorna as mais recentes primeiro, então invertemos para ordem cronológica
-            mensagens_da_api.reverse() 
-            
-            print(f"   -> {len(mensagens_da_api)} mensagens recuperadas e formatadas.")
-            return formatar_historico_para_gemini(mensagens_da_api)
+    print(f"   -> Iniciando busca do histórico completo de '{remetente_jid}'...")
+    
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            while pagina_atual <= total_paginas:
+                print(f"     -> Buscando página {pagina_atual}/{total_paginas}...")
+                payload = {
+                    "page": pagina_atual,
+                    "pageSize": 100, # ou 'offset': 100, dependendo da sua versão da API
+                    "where": {
+                        "key": {"remoteJid": remetente_jid}
+                    }
+                }
+                response = await client.post(url, headers=headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
+
+                # A estrutura da resposta pode variar, ajuste se necessário
+                messages_data = data.get("messages", data)
+
+                if pagina_atual == 1:
+                    total_paginas = messages_data.get("pages", 1)
+
+                mensagens_da_pagina = messages_data.get("records", [])
+                historico_completo.extend(mensagens_da_pagina)
+                pagina_atual += 1
+
+        # A API retorna as mais recentes primeiro em cada página, então ordenamos no final
+        historico_ordenado = sorted(historico_completo, key=lambda msg: int(msg.get("messageTimestamp", 0)))
+        
+        print(f"   -> {len(historico_ordenado)} mensagens recuperadas e formatadas.")
+        return formatar_historico_para_gemini(historico_ordenado)
+
     except httpx.RequestError as e:
         print(f"   🚨 Erro ao buscar histórico da API: {e}")
-        return [] # Retorna um histórico vazio em caso de falha
+        return []
 
 async def enviar_presenca(remetente_jid: str, tipo_presenca: str):
     """Envia uma notificação de presença (digitando ou pausado)."""
@@ -118,8 +126,6 @@ async def enviar_resposta_whatsapp(remetente_jid: str, texto_resposta: str):
     """Envia a resposta gerada de volta para o usuário."""
     url = f"{EVOLUTION_API_URL}/message/sendText/{EVOLUTION_INSTANCE_NAME}"
     headers = {"Content-Type": "application/json", "apikey": EVOLUTION_API_KEY}
-    
-    # Usando a estrutura de payload que já foi validada e funciona.
     payload = {
         "number": remetente_jid,
         "text": texto_resposta,
@@ -145,7 +151,7 @@ async def enviar_resposta_whatsapp(remetente_jid: str, texto_resposta: str):
                 print(f"   -> Resposta do Erro (não-JSON): {e.response.text}")
 
 # --- Aplicação FastAPI ---
-app = FastAPI(title="Chatbot WhatsApp com Gemini (sem Redis)")
+app = FastAPI(title="Chatbot WhatsApp com Gemini (com Áudio)")
 
 @app.get("/health")
 def health_check():
@@ -178,27 +184,75 @@ async def webhook_receiver(request: Request):
     if "ephemeralMessage" in message_obj:
         message_obj = message_obj.get("ephemeralMessage", {}).get("message", {})
 
-    nova_mensagem_texto = (
-        message_obj.get("extendedTextMessage", {}).get("text") or
-        message_obj.get("conversation", "")
-    ).strip()
+    # ALTERADO: Lógica para extrair texto OU áudio
+    nova_mensagem_texto = None
+    arquivo_audio = None
 
-    if not nova_mensagem_texto:
-        return {"status": "ignorado"}
+    if "extendedTextMessage" in message_obj or "conversation" in message_obj:
+        nova_mensagem_texto = (
+            message_obj.get("extendedTextMessage", {}).get("text") or
+            message_obj.get("conversation", "")
+        ).strip()
+        print(f"\n--- Mensagem de Texto Recebida de {remetente_jid} ---")
+        print(f"Mensagem: {nova_mensagem_texto}")
 
-    print(f"\n--- Mensagem Recebida de {remetente_jid} ---")
-    print(f"Mensagem: {nova_mensagem_texto}")
-        
+    elif "audioMessage" in message_obj:
+        print(f"\n--- Mensagem de Áudio Recebida de {remetente_jid} ---")
+        audio_info = message_obj["audioMessage"]
+        audio_url = audio_info.get("url")
+        if audio_url:
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(audio_url)
+                    response.raise_for_status()
+                    audio_data = response.content
+                    mime_type = audio_info.get("mimetype", "audio/ogg")
+                    
+                    arquivo_audio = genai.upload_file(
+                        path="audio.ogg", # Nome temporário
+                        display_name="Mensagem de Voz",
+                        mime_type=mime_type
+                    )
+                    # Reescreve o arquivo localmente para enviar
+                    with open("audio.ogg", "wb") as f:
+                        f.write(audio_data)
+
+                    print(f"   -> Áudio baixado ({len(audio_data)} bytes) e preparado para o Gemini.")
+            except Exception as e:
+                print(f"   🚨 Falha ao baixar ou preparar o áudio: {e}")
+                # Envia uma mensagem de erro para o usuário
+                await enviar_resposta_whatsapp(remetente_jid, "Desculpe, não consegui processar seu áudio. Tente novamente.")
+                return {"status": "erro_audio"}
+
+    if not nova_mensagem_texto and not arquivo_audio:
+        return {"status": "ignorado_sem_conteudo"}
+
     try:
-        # Busca o histórico da API
         historico_conversa = await obter_historico_conversa(remetente_jid)
         
-        # Adiciona a mensagem atual ao histórico para o Gemini ter o contexto completo
-        historico_conversa.append({'role': 'user', 'parts': [{'text': nova_mensagem_texto}]})
+        # ALTERADO: Monta o conteúdo para o Gemini (texto, áudio ou ambos)
+        conteudo_para_gemini = []
         
+        # Adiciona o histórico de texto anterior
+        for item in historico_conversa:
+            conteudo_para_gemini.extend(item['parts'])
+
+        # Prepara a mensagem atual
+        prompt_atual = "Responda a esta mensagem: "
+        if nova_mensagem_texto:
+            conteudo_para_gemini.append({'text': nova_mensagem_texto})
+        if arquivo_audio:
+            # Pede para o modelo transcrever e responder
+            prompt_transcricao = "Transcreva o áudio a seguir e, em seguida, responda ao que foi dito de forma apropriada:"
+            conteudo_para_gemini.append({'text': prompt_transcricao})
+            conteudo_para_gemini.append(arquivo_audio)
+
+
         print("   -> Enviando para o Gemini...")
-        chat = model.start_chat(history=historico_conversa)
-        resposta_gemini = chat.send_message(nova_mensagem_texto)
+        
+        # ALTERADO: Usa generate_content que é mais flexível para multimodal
+        resposta_gemini = model.generate_content(conteudo_para_gemini)
+        
         texto_resposta = resposta_gemini.text
         print(f"   -> Resposta do Gemini: {texto_resposta}")
 
@@ -215,4 +269,3 @@ async def webhook_receiver(request: Request):
         raise HTTPException(status_code=500, detail="Erro interno no processamento do chatbot")
     
     return {"status": "recebido_e_processado"}
-
