@@ -75,8 +75,8 @@ async def webhook_connection_update(request: Request):
     print(f"✅ Evento de conexão recebido da instância '{instance}': {state}")
     return {"status": "connection_update_received"}
 
-# Rota principal para receber mensagens
-@app.post("/")
+# Rota para receber novas mensagens
+@app.post("/messages-upsert")
 async def webhook_receiver(request: Request):
     data = await request.json()
     
@@ -144,3 +144,4 @@ async def webhook_receiver(request: Request):
         raise HTTPException(status_code=500, detail="Erro interno no processamento do chatbot")
     
     return {"status": "recebido_e_processado"}
+
