@@ -80,8 +80,18 @@ async def obter_historico_conversa(remetente_jid: str):
         async with httpx.AsyncClient() as client:
             response = await client.post(url, headers=headers, json=payload, timeout=30)
             response.raise_for_status()
-            mensagens_da_api = response.json()
+            dados_brutos = response.json()
             
+            # --- CORREÇÃO APLICADA AQUI ---
+            # Verifica se a resposta é um dicionário e extrai a lista de mensagens
+            if isinstance(dados_brutos, dict) and "messages" in dados_brutos:
+                mensagens_da_api = dados_brutos["messages"]
+            elif isinstance(dados_brutos, list):
+                mensagens_da_api = dados_brutos
+            else:
+                mensagens_da_api = []
+            # --------------------------------
+
             # A API retorna as mais recentes primeiro, então invertemos para ordem cronológica
             mensagens_da_api.reverse() 
             
@@ -108,6 +118,8 @@ async def enviar_resposta_whatsapp(remetente_jid: str, texto_resposta: str):
     """Envia a resposta gerada de volta para o usuário."""
     url = f"{EVOLUTION_API_URL}/message/sendText/{EVOLUTION_INSTANCE_NAME}"
     headers = {"Content-Type": "application/json", "apikey": EVOLUTION_API_KEY}
+    
+    # Usando a estrutura de payload que já foi validada e funciona.
     payload = {
         "number": remetente_jid,
         "text": texto_resposta,
