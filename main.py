@@ -63,23 +63,29 @@ def formatar_historico_para_gemini(mensagens_api: list):
         })
     return historico_formatado
 
-async def obter_historico_conversa(remetente_jid: str, limite: int = 20):
+async def obter_historico_conversa(remetente_jid: str):
     """Busca o histórico de mensagens da API da Evolution e formata para o Gemini."""
     url = f"{EVOLUTION_API_URL}/chat/findMessages/{EVOLUTION_INSTANCE_NAME}"
-    headers = {"apikey": EVOLUTION_API_KEY}
-    params = {"number": remetente_jid, "limit": limite}
+    headers = {"Content-Type": "application/json", "apikey": EVOLUTION_API_KEY}
+    payload = {
+        "where": {
+            "key": {
+                "remoteJid": remetente_jid
+            }
+        }
+    }
     
-    print(f"   -> Buscando histórico de '{remetente_jid}' na API...")
+    print(f"   -> Buscando histórico completo de '{remetente_jid}' na API via POST...")
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.get(url, headers=headers, params=params, timeout=30)
+            response = await client.post(url, headers=headers, json=payload, timeout=30)
             response.raise_for_status()
             mensagens_da_api = response.json()
             
             # A API retorna as mais recentes primeiro, então invertemos para ordem cronológica
             mensagens_da_api.reverse() 
             
-            print(f"   -> {len(mensagens_da_api)} mensagens recuperadas.")
+            print(f"   -> {len(mensagens_da_api)} mensagens recuperadas e formatadas.")
             return formatar_historico_para_gemini(mensagens_da_api)
     except httpx.RequestError as e:
         print(f"   🚨 Erro ao buscar histórico da API: {e}")
