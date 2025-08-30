@@ -2,7 +2,6 @@ fastapi
 uvicorn
 gunicorn
 python-dotenv
-redis
 google-generativeai
 requests
 httpx
