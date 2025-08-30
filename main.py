@@ -1,6 +1,6 @@
 import os
 import json
-import requests
+import httpx
 import redis
 import google.generativeai as genai
 import asyncio
@@ -54,11 +54,10 @@ async def enviar_presenca(remetente_jid: str, tipo_presenca: str):
     payload = {"number": remetente_jid, "presence": tipo_presenca}
     
     try:
-        # Usamos uma sessão para enviar de forma assíncrona
-        async with requests.AsyncClient() as client:
+        async with httpx.AsyncClient() as client:
             await client.post(url, headers=headers, json=payload, timeout=10)
         print(f"   -> Presença '{tipo_presenca}' enviada para {remetente_jid}.")
-    except requests.exceptions.RequestException as e:
+    except httpx.RequestError as e:
         print(f"   🚨 Erro ao enviar presença: {e}")
 
 async def enviar_resposta_whatsapp(remetente_jid: str, texto_resposta: str):
@@ -75,14 +74,13 @@ async def enviar_resposta_whatsapp(remetente_jid: str, texto_resposta: str):
     
     print(f"   -> Enviando resposta para {remetente_jid}...")
     try:
-        # Usamos uma sessão para enviar de forma assíncrona
-        async with requests.AsyncClient() as client:
+        async with httpx.AsyncClient() as client:
             response = await client.post(url, headers=headers, json=payload, timeout=30)
             response.raise_for_status()
         print("   -> Resposta enviada com sucesso!")
-    except requests.exceptions.RequestException as e:
+    except httpx.RequestError as e:
         print(f"   🚨 Erro ao enviar resposta via Evolution API: {e}")
-        if e.response:
+        if hasattr(e, 'response') and e.response:
             print(f"   -> Status Code: {e.response.status_code}")
             try:
                 print(f"   -> Resposta do Erro: {e.response.json()}")
@@ -170,20 +168,11 @@ async def webhook_receiver(request: Request):
         print("   -> Histórico atualizado no Redis.")
 
         # --- LÓGICA DE DIGITAÇÃO E ESPERA ---
-        # 1. Calcula um delay baseado no tamanho da resposta para parecer mais natural
-        # Média de 60ms por caractere, com um mínimo de 2s e máximo de 8s.
         tempo_de_espera = min(max(len(texto_resposta) * 0.06, 2), 8)
         
-        # 2. Envia o status "digitando..."
         await enviar_presenca(remetente_jid, "composing")
-        
-        # 3. Espera o tempo calculado
         await asyncio.sleep(tempo_de_espera)
-        
-        # 4. Envia o status "pausado" (opcional, mas bom para encerrar o "digitando")
         await enviar_presenca(remetente_jid, "paused")
-        
-        # 5. Envia a mensagem de fato
         await enviar_resposta_whatsapp(remetente_jid, texto_resposta)
         # ------------------------------------
 
