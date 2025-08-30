@@ -3,13 +3,13 @@ import json
 import requests
 import redis
 import google.generativeai as genai
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from dotenv import load_dotenv
 
 # --- Carregando as Configurações do .env ---
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME") # <-- Carrega o nome do modelo
+GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME")
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT")
 REDIS_URL = os.getenv("REDIS_URL")
 EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL")
@@ -24,11 +24,10 @@ if not all(config_vars):
     exit()
 
 # --- Configuração dos Clientes ---
-# Cliente do Gemini, agora com o modelo e a persona carregados do .env
 try:
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel(
-        model_name=GEMINI_MODEL_NAME, # <-- Usa a variável aqui
+        model_name=GEMINI_MODEL_NAME,
         system_instruction=SYSTEM_PROMPT
     )
     print(f"✅ Modelo Gemini '{GEMINI_MODEL_NAME}' configurado com a persona.")
@@ -36,7 +35,6 @@ except Exception as e:
     print(f"🚨 ERRO CRÍTICO ao configurar o modelo Gemini: {e}")
     exit()
 
-# Cliente do Redis
 try:
     redis_client = redis.from_url(REDIS_URL, decode_responses=True)
     redis_client.ping()
@@ -45,12 +43,12 @@ except Exception as e:
     print(f"🚨 ERRO CRÍTICO ao conectar com o Redis: {e}")
     redis_client = None
 
-# --- Função para Enviar Respostas via Evolution API ---
+# --- Funções Auxiliares ---
 def enviar_resposta_whatsapp(remetente_jid: str, texto_resposta: str):
     """Envia a resposta gerada de volta para o usuário."""
     url = f"{EVOLUTION_API_URL}/message/sendText/{EVOLUTION_INSTANCE_NAME}"
     headers = {"Content-Type": "application/json", "apikey": EVOLUTION_API_KEY}
-    payload = {"number": remetente_jid, "text": texto_resposta}
+    payload = {"number": remetente_jid, "options": {"delay": 1200}, "textMessage": {"text": texto_resposta}}
     
     print(f"   -> Enviando resposta para {remetente_jid}...")
     try:
@@ -63,11 +61,25 @@ def enviar_resposta_whatsapp(remetente_jid: str, texto_resposta: str):
 # --- Aplicação FastAPI ---
 app = FastAPI(title="Chatbot WhatsApp com Gemini e Redis")
 
+# Rota para verificação de saúde
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
+# Rota para eventos de conexão
+@app.post("/connection-update")
+async def webhook_connection_update(request: Request):
+    data = await request.json()
+    instance = data.get("instance")
+    state = data.get("data", {}).get("state")
+    print(f"✅ Evento de conexão recebido da instância '{instance}': {state}")
+    return {"status": "connection_update_received"}
+
+# Rota principal para receber mensagens
 @app.post("/")
 async def webhook_receiver(request: Request):
     data = await request.json()
     
-    # Verificamos se é um evento de mensagem recebida
     if data.get("event") != "MESSAGES_UPSERT":
         return {"status": "evento_ignorado", "reason": "nao_e_messages_upsert"}
 
@@ -75,24 +87,18 @@ async def webhook_receiver(request: Request):
     if not mensagem_data:
         return {"status": "evento_ignorado", "reason": "sem_payload_de_dados"}
 
-    # Ignoramos mensagens enviadas por nós mesmos
     if mensagem_data.get("key", {}).get("fromMe", False):
         return {"status": "ignorado", "reason": "mensagem_propria"}
         
     remetente_jid = mensagem_data.get("key", {}).get("remoteJid")
     if not remetente_jid:
-        return {"status": "erro", "reason": "remetente_desconhecido"}
+        raise HTTPException(status_code=400, detail="Remetente desconhecido")
     
-    # Filtra para responder apenas ao contato alvo definido no .env
     if remetente_jid != TARGET_JID:
-        print(f"   -> Mensagem de {remetente_jid} ignorada (não é o contato alvo).")
+        print(f"   -> Mensagem de {remetente_jid} ignorada (não é o contato alvo).")
         return {"status": "ignorado", "reason": "nao_e_contato_alvo"}
 
-    # --- LÓGICA DE EXTRAÇÃO DE TEXTO CORRIGIDA ---
-    # Tentamos obter a mensagem de várias fontes possíveis para cobrir todos os casos
     message_obj = mensagem_data.get("message", {})
-    
-    # Se for uma mensagem temporária, usamos o objeto aninhado
     if "ephemeralMessage" in message_obj:
         message_obj = message_obj.get("ephemeralMessage", {}).get("message", {})
 
@@ -100,57 +106,41 @@ async def webhook_receiver(request: Request):
         message_obj.get("extendedTextMessage", {}).get("text") or
         message_obj.get("conversation", "")
     ).strip()
-    # -----------------------------------------------
 
-    # Se não houver texto na mensagem (ex: imagem, áudio), ignoramos por enquanto
     if not nova_mensagem_texto:
-        print(f"   -> Mensagem de {remetente_jid} ignorada (sem conteúdo de texto).")
+        print(f"   -> Mensagem de {remetente_jid} ignorada (sem conteúdo de texto).")
         return {"status": "ignorado", "reason": "sem_texto"}
 
     print(f"\n--- Mensagem Recebida de {remetente_jid} ---")
     print(f"Mensagem: {nova_mensagem_texto}")
 
     if not redis_client:
-        print("   🚨 Atenção: Cliente Redis não está disponível. A conversa não terá memória.")
-        # Podemos optar por responder sem memória ou simplesmente parar
-        return {"status": "erro", "reason": "redis_indisponivel"}
+        print("   🚨 Atenção: Cliente Redis não está disponível. A conversa não terá memória.")
+        raise HTTPException(status_code=503, detail="Redis indisponível")
         
     try:
         history_key = f"history:{remetente_jid}"
-        
         conversa_json = redis_client.get(history_key)
         historico_conversa = json.loads(conversa_json) if conversa_json else []
-        print(f"   -> Histórico recuperado: {len(historico_conversa)} turnos.")
+        print(f"   -> Histórico recuperado: {len(historico_conversa)} turnos.")
         
-        # Adiciona a mensagem do usuário ao histórico
         historico_conversa.append({'role': 'user', 'parts': [{'text': nova_mensagem_texto}]})
         
-        # Inicia o chat com o histórico e gera a nova resposta
-        print("   -> Enviando para o Gemini...")
+        print("   -> Enviando para o Gemini...")
         chat = model.start_chat(history=historico_conversa)
-        # NOTA: O Gemini já usa o histórico, não precisa reenviar a última mensagem
-        resposta_gemini = chat.send_message(nova_mensagem_texto) 
+        resposta_gemini = chat.send_message(nova_mensagem_texto)
         texto_resposta = resposta_gemini.text
-        print(f"   -> Resposta do Gemini: {texto_resposta}")
+        print(f"   -> Resposta do Gemini: {texto_resposta}")
 
-        # Adiciona a resposta do modelo ao histórico
-        # A linha abaixo estava duplicando a mensagem do usuário no histórico, vamos corrigir:
-        # A mensagem do usuário já foi adicionada, agora adicionamos a do modelo.
         historico_conversa.append({'role': 'model', 'parts': [{'text': texto_resposta}]})
         
-        # Salva o histórico atualizado no Redis
         redis_client.set(history_key, json.dumps(historico_conversa))
-        print("   -> Histórico atualizado no Redis.")
+        print("   -> Histórico atualizado no Redis.")
 
         enviar_resposta_whatsapp(remetente_jid, texto_resposta)
 
     except Exception as e:
-        print(f"   🚨 Erro no ciclo do chatbot: {e}")
-        return {"status": "erro_interno"}
+        print(f"   🚨 Erro no ciclo do chatbot: {e}")
+        raise HTTPException(status_code=500, detail="Erro interno no processamento do chatbot")
     
     return {"status": "recebido_e_processado"}
-
-@app.get("/health")
-def health_check():
-    return {"status": "ok"}
-
